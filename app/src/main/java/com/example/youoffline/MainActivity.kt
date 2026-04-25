@@ -19,6 +19,9 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import androidx.core.content.ContextCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
@@ -140,7 +143,8 @@ class MainActivity : ComponentActivity() {
     private val viewModel: DownloadViewModel by viewModels()
     private val videoViewModel: VideoViewModel by viewModels()
     private val urlRegex = Regex("https?://\\S+")
-    var sharedUrl: String? = null
+    private val _sharedUrl = MutableStateFlow<String?>(null)
+    val sharedUrl: StateFlow<String?> = _sharedUrl.asStateFlow()
     var selectedTab: Int = 0  // 0 = audio, 1 = video
 
     private val mediaReadPermissionLauncher =
@@ -210,12 +214,12 @@ class MainActivity : ComponentActivity() {
         if (sharedText.isBlank()) return
 
         val url = extractFirstUrl(sharedText) ?: return
-        sharedUrl = url
+        _sharedUrl.value = url
         ShortcutManagerCompat.reportShortcutUsed(this, SHARE_SHORTCUT_ID)
     }
 
     fun handleShareUrlSelection(format: String) {
-        val url = sharedUrl ?: return
+        val url = _sharedUrl.value ?: return
         
         when (format) {
             "audio" -> {
@@ -229,7 +233,11 @@ class MainActivity : ComponentActivity() {
                 videoViewModel.startDownload()
             }
         }
-        sharedUrl = null
+        _sharedUrl.value = null
+    }
+
+    fun clearSharedUrl() {
+        _sharedUrl.value = null
     }
 
 
@@ -300,21 +308,24 @@ private fun AppRoot(
 ) {
     var selectedTab by remember { mutableIntStateOf(mainActivity.selectedTab) }
     val videoState by videoViewModel.uiState.collectAsStateWithLifecycle()
+    val sharedUrl by mainActivity.sharedUrl.collectAsStateWithLifecycle()
     var showShareDialog by remember { mutableStateOf(false) }
 
-    LaunchedEffect(mainActivity.sharedUrl) {
-        showShareDialog = mainActivity.sharedUrl != null
+    LaunchedEffect(sharedUrl) {
+        if (sharedUrl != null) {
+            showShareDialog = true
+        }
     }
 
     LaunchedEffect(mainActivity.selectedTab) {
         selectedTab = mainActivity.selectedTab
     }
 
-    if (showShareDialog && mainActivity.sharedUrl != null) {
+    if (showShareDialog && sharedUrl != null) {
         AlertDialog(
             onDismissRequest = { 
                 showShareDialog = false
-                mainActivity.sharedUrl = null
+                mainActivity.clearSharedUrl()
             },
             title = { Text("Выберите формат") },
             text = { Text("Скачать видео или аудио?") },
