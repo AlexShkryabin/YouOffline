@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:shortcutId="share_to_audio"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/share_shortcut_short"
+        android:shortcutLongLabel="@string/share_shortcut_long">
+        <intent
+            android:action="android.intent.action.SEND"
+            android:targetPackage="com.example.youoffline"
+            android:targetClass="com.example.youoffline.MainActivity"
+            android:mimeType="text/plain" />
+        <categories android:name="com.example.youoffline.SHARE_TARGET" />
+    </shortcut>
+
+    <share-target android:targetClass="com.example.youoffline.MainActivity">
+        <data android:mimeType="text/plain" />
+        <category android:name="com.example.youoffline.SHARE_TARGET" />
+    </share-target>
+
+</shortcuts>

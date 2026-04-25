@@ -1,0 +1,5 @@
+# Yandex Mobile Ads unit IDs — EXAMPLE
+# Copy to ads.properties and fill in your real IDs.
+AD_UNIT_AUDIO_BANNER=R-M-XXXXXXXX-1
+AD_UNIT_VIDEO_BANNER=R-M-XXXXXXXX-3
+AD_UNIT_INTERSTITIAL=R-M-XXXXXXXX-2

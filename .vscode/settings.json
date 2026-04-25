@@ -1,0 +1,18 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^adb logcat -d \\| Select-String -Pattern \"FATAL EXCEPTION\\|AndroidRuntime\\|com\\.example\\.youoffline\\|BypassVpnService\\|FileNotFoundException\\|SecurityException\" \\| Select-Object -Last 200 \\| Out-String$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "adb": true,
+        "/^adb logcat -c; adb shell am force-stop com\\.example\\.youoffline; adb shell monkey -p com\\.example\\.youoffline -c android\\.intent\\.category\\.LAUNCHER 1; adb logcat -d -v time \\| Select-String -Pattern \"AndroidRuntime\\|FATAL EXCEPTION\\|YandexAds\\|com\\.example\\.youoffline\" \\| Select-Object -Last 100 \\| ForEach-Object \\{ \\$_\\.Line \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^Select-String -Path \"c:\\\\Users\\\\Mi\\\\VSProjects\\\\YouOffline\\\\app\\\\build\\\\intermediates\\\\merged_manifests\\\\debug\\\\processDebugMainManifest\\\\AndroidManifest\\.xml\" -Pattern \"yandex\\|MobileAds\\|provider\" \\| ForEach-Object \\{ \"\\{0\\}:\\{1\\}\" -f \\$_\\.LineNumber, \\$_\\.Line\\.Trim\\(\\) \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "ForEach-Object": true
+    }
+}

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">YouOffline</string>
+    <string name="share_shortcut_short">Офлайн Аудио</string>
+    <string name="share_shortcut_long">Сохранить аудио по ссылке</string>
+</resources>
