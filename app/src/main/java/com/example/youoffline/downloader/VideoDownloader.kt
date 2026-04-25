@@ -20,10 +20,12 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "VideoDownloader"
 private const val YT_DLP_UPDATE_ATTEMPT_KEY = "yt_dlp_last_update_attempt_ms"
@@ -36,6 +38,19 @@ class VideoDownloader(private val context: Context) {
     private val initialized = AtomicBoolean(false)
     private val thumbDir = File(context.filesDir, "video_thumbs").also { it.mkdirs() }
     private val metaPrefs = context.getSharedPreferences("youoffline_meta", Context.MODE_PRIVATE)
+    private val cancelRequested = AtomicBoolean(false)
+    private val activeRequestFuture = AtomicReference<Future<*>?>(null)
+
+    fun cancelActiveDownload() {
+        cancelRequested.set(true)
+        activeRequestFuture.get()?.cancel(true)
+    }
+
+    private fun ensureNotCancelled() {
+        if (cancelRequested.get()) {
+            throw DownloadCancelledException()
+        }
+    }
 
     private fun ensureInitialized() {
         if (initialized.get()) return
@@ -84,13 +99,16 @@ class VideoDownloader(private val context: Context) {
     fun downloadVideo(
         url: String,
         quality: VideoQuality,
-        onProgress: (Float, String) -> Unit
+        onProgress: (Float, String) -> Unit,
+        onTrackSaved: (() -> Unit)? = null,
+        onTrackStart: ((trackNumber: Int) -> Unit)? = null
     ) {
+        cancelRequested.set(false)
+        ensureNotCancelled()
         ensureInitialized()
         val tempDir = File(context.cacheDir, "video_downloads").apply { mkdirs() }
         cleanDir(tempDir)
-
-        val beforeFiles = tempDir.listFiles()?.map { it.absolutePath }?.toSet() ?: emptySet()
+        val isPlaylist = isPlaylistUrl(url)
 
         // Cascade through lower resolutions before giving up on DASH entirely.
         // YouTube progressive ("best") streams max at ~360p — avoid them until last resort.
@@ -111,25 +129,112 @@ class VideoDownloader(private val context: Context) {
         }
         Log.d(TAG, "DOWNLOAD_FORMAT: quality=$quality format=$format")
 
-        // android_vr client: not subject to SABR enforcement, supports DASH streams,
-        // and does not require the EJS n-challenge solver (safe for Android).
+        var chunkIndex = 0
+        var savedCount = 0
+        var lastResponse = DownloadResponse(1, "Не начато")
+
+        while (true) {
+            ensureNotCancelled()
+
+            val chunkRange = if (isPlaylist) {
+                val trackNum = chunkIndex + 1
+                onTrackStart?.invoke(trackNum)
+                onProgress(0f, "Трек $trackNum · Подготовка...")
+                "$trackNum-$trackNum"
+            } else {
+                null
+            }
+
+            val beforeFiles = tempDir.listFiles()?.map { it.absolutePath }?.toSet() ?: emptySet()
+            lastResponse = downloadSingleRequestWithFallback(
+                url = url,
+                format = format,
+                progressiveFormat = progressiveFormat,
+                tempDir = tempDir,
+                onProgress = onProgress,
+                playlistItems = chunkRange
+            )
+
+            if (cancelRequested.get() || lastResponse.exitCode == 130) {
+                throw DownloadCancelledException()
+            }
+
+            val videoExts = setOf("mp4", "mkv", "webm", "avi", "mov")
+            val newFiles = tempDir.listFiles()
+                ?.filter { it.isFile && it.absolutePath !in beforeFiles }
+                ?.filter { it.extension.lowercase(Locale.US) in videoExts }
+                ?.sortedByDescending { it.lastModified() }
+                ?: emptyList()
+
+            if (newFiles.isEmpty()) {
+                if (!isPlaylist) {
+                    val details = (lastResponse.out + "\n" + lastResponse.err)
+                        .trim()
+                        .ifBlank { "Видеофайл не найден после скачивания" }
+                    throw IOException(details)
+                }
+                break
+            }
+
+            val thumbExts = setOf("jpg", "jpeg", "webp")
+            val thumbFile = tempDir.listFiles()
+                ?.filter { it.isFile && it.absolutePath !in beforeFiles }
+                ?.filter { it.extension.lowercase(Locale.US) in thumbExts }
+                ?.maxByOrNull { it.lastModified() }
+
+            newFiles.forEach {
+                ensureNotCancelled()
+                val trackNum = if (isPlaylist) chunkIndex + 1 else 0
+                onProgress(1f, if (trackNum > 0) "Трек $trackNum · Сохранение..." else "Сохранение...")
+                saveToMovies(it, thumbFile)
+                savedCount++
+                onTrackSaved?.invoke()
+            }
+
+            if (!isPlaylist) break
+            if (lastResponse.exitCode != 0) break
+            chunkIndex++
+        }
+
+        if (cancelRequested.get() || lastResponse.exitCode == 130) {
+            throw DownloadCancelledException()
+        }
+
+        if (savedCount == 0 && lastResponse.exitCode != 0) {
+            val details = (lastResponse.out + "\n" + lastResponse.err)
+                .trim()
+                .ifBlank { "yt-dlp завершился с ошибкой, код=${lastResponse.exitCode}" }
+            Log.e(TAG, "Final video download failure, exitCode=${lastResponse.exitCode}, details=$details")
+            throw IOException(details)
+        }
+
+        if (savedCount == 0) {
+            throw IOException("Видеофайл не найден после скачивания")
+        }
+    }
+
+    private fun downloadSingleRequestWithFallback(
+        url: String,
+        format: String,
+        progressiveFormat: String,
+        tempDir: File,
+        onProgress: (Float, String) -> Unit,
+        playlistItems: String?
+    ): DownloadResponse {
         var response = executeRequest(
             buildDownloadRequest(
-                url,
-                format,
-                tempDir,
-                extractorArgs = "youtube:player_client=android_vr"
+                url = url,
+                format = format,
+                tempDir = tempDir,
+                extractorArgs = "youtube:player_client=android_vr",
+                allowPlaylist = !playlistItems.isNullOrBlank(),
+                playlistItems = playlistItems
             ),
             onProgress,
             timeoutSeconds = 120L
         )
 
         if (response.exitCode != 0) {
-            // Do NOT force-update yt-dlp on error: new STABLE versions require EJS
-            // (external JS runtime) unavailable on Android, breaking n-challenge and DASH.
-
-            // android_vr and tv_embedded avoid SABR and work without EJS.
-            // Web clients (web/mweb/web_creator) are subject to SABR — skip them.
             val retryPlans = listOf(
                 Triple("youtube:player_client=tv_embedded", format, "Повтор 1/4: tv_embedded клиент..."),
                 Triple("youtube:player_client=android_vr,tv_embedded", format, "Повтор 2/4: android_vr+tv_embedded..."),
@@ -138,6 +243,7 @@ class VideoDownloader(private val context: Context) {
             )
 
             for ((extractorArgs, retryFormat, statusText) in retryPlans) {
+                ensureNotCancelled()
                 if (response.exitCode == 0) break
 
                 onProgress(0f, statusText)
@@ -151,7 +257,9 @@ class VideoDownloader(private val context: Context) {
                         url = url,
                         format = retryFormat,
                         tempDir = tempDir,
-                        extractorArgs = extractorArgs
+                        extractorArgs = extractorArgs,
+                        allowPlaylist = !playlistItems.isNullOrBlank(),
+                        playlistItems = playlistItems
                     ),
                     onProgress,
                     timeoutSeconds = 120L
@@ -160,63 +268,27 @@ class VideoDownloader(private val context: Context) {
         }
 
         if (response.exitCode != 0) {
+            ensureNotCancelled()
             val details = (response.out + "\n" + response.err).trim()
             if (isSabrOrForbidden(details)) {
-                val emergencyFormat = when (quality) {
-                    VideoQuality.BEST -> "best[ext=mp4]/best"
-                    VideoQuality.Q1440P -> "best[height<=1440][ext=mp4]/best[height<=1440]/best"
-                    VideoQuality.Q1080P -> "best[height<=1080][ext=mp4]/best[height<=1080]/best"
-                    VideoQuality.Q720P -> "best[height<=720][ext=mp4]/best[height<=720]/best"
-                    VideoQuality.Q480P -> "best[height<=480][ext=mp4]/best[height<=480]/best"
-                }
+                val emergencyFormat = "best[ext=mp4]/best"
                 onProgress(0f, "Финальная попытка загрузки...")
                 Log.w(TAG, "EMERGENCY_FALLBACK: trying safe progressive format=$emergencyFormat")
                 response = executeRequest(
-                    buildEmergencyRequest(url, emergencyFormat, tempDir),
+                    buildEmergencyRequest(
+                        url = url,
+                        format = emergencyFormat,
+                        tempDir = tempDir,
+                        allowPlaylist = !playlistItems.isNullOrBlank(),
+                        playlistItems = playlistItems
+                    ),
                     onProgress,
                     timeoutSeconds = 120L
                 )
             }
         }
 
-        if (response.exitCode != 0) {
-            val details = (response.out + "\n" + response.err).trim().ifBlank { "yt-dlp завершился с ошибкой, код=${response.exitCode}" }
-            Log.e(TAG, "Final video download failure, exitCode=${response.exitCode}, details=$details")
-            throw IOException(details)
-        }
-
-        val videoExts = setOf("mp4", "mkv", "webm", "avi", "mov")
-        var newFiles = tempDir.listFiles()
-            ?.filter { it.isFile && it.absolutePath !in beforeFiles }
-            ?.filter { it.extension.lowercase(Locale.US) in videoExts }
-            ?.sortedByDescending { it.lastModified() }
-            ?: emptyList()
-
-        var fileToSave = chooseBestDownloadedFile(newFiles)
-            ?: throw IOException("Видеофайл не найден после скачивания")
-
-        // Some retry/fallback scenarios can replace/remove intermediate files.
-        // Revalidate selected path right before saving to avoid ENOENT.
-        if (!fileToSave.exists()) {
-            Log.w(TAG, "Selected video file disappeared before save: ${fileToSave.absolutePath}")
-            newFiles = tempDir.listFiles()
-                ?.filter { it.isFile }
-                ?.filter { it.extension.lowercase(Locale.US) in videoExts }
-                ?.sortedByDescending { it.lastModified() }
-                ?: emptyList()
-            fileToSave = chooseBestDownloadedFile(newFiles)
-                ?: throw IOException("Видеофайл исчез перед сохранением")
-            Log.d(TAG, "Re-selected video file: ${fileToSave.absolutePath}")
-        }
-
-        val thumbExts = setOf("jpg", "jpeg", "webp")
-        val thumbFile = tempDir.listFiles()
-            ?.filter { it.isFile }
-            ?.filter { it.extension.lowercase(Locale.US) in thumbExts }
-            ?.maxByOrNull { it.lastModified() }
-
-        onProgress(1f, "Сохранение...")
-        saveToMovies(fileToSave, thumbFile)
+        return response
     }
 
     private fun chooseBestDownloadedFile(files: List<File>): File? {
@@ -231,11 +303,21 @@ class VideoDownloader(private val context: Context) {
         url: String,
         format: String,
         tempDir: File,
-        extractorArgs: String?
+        extractorArgs: String?,
+        allowPlaylist: Boolean = false,
+        playlistItems: String? = null
     ): YoutubeDLRequest {
         val uniquePrefix = UUID.randomUUID().toString().substring(0, 8)
         return YoutubeDLRequest(url).apply {
-            addOption("--no-playlist")
+            if (allowPlaylist) {
+                addOption("--yes-playlist")
+                addOption("--ignore-errors")
+                if (!playlistItems.isNullOrBlank()) {
+                    addOption("--playlist-items", playlistItems)
+                }
+            } else {
+                addOption("--no-playlist")
+            }
             addOption("--newline")
             addOption("--no-update")
             addOption("--no-part")
@@ -255,11 +337,21 @@ class VideoDownloader(private val context: Context) {
     private fun buildEmergencyRequest(
         url: String,
         format: String,
-        tempDir: File
+        tempDir: File,
+        allowPlaylist: Boolean = false,
+        playlistItems: String? = null
     ): YoutubeDLRequest {
         val uniquePrefix = UUID.randomUUID().toString().substring(0, 8)
         return YoutubeDLRequest(url).apply {
-            addOption("--no-playlist")
+            if (allowPlaylist) {
+                addOption("--yes-playlist")
+                addOption("--ignore-errors")
+                if (!playlistItems.isNullOrBlank()) {
+                    addOption("--playlist-items", playlistItems)
+                }
+            } else {
+                addOption("--no-playlist")
+            }
             addOption("--no-update")
             addOption("--no-part")
             addOption("--no-continue")
@@ -267,6 +359,10 @@ class VideoDownloader(private val context: Context) {
             addOption("-f", format)
             addOption("-o", "${tempDir.absolutePath}/${uniquePrefix}_%(title)s.%(ext)s")
         }
+    }
+
+    private fun isPlaylistUrl(url: String): Boolean {
+        return url.contains("list=", ignoreCase = true)
     }
 
     private fun isSabrOrForbidden(message: String): Boolean {
@@ -329,9 +425,14 @@ class VideoDownloader(private val context: Context) {
                     onProgress(stableP, mappedStatus)
                 }
             }
+            activeRequestFuture.set(future)
 
             var lastHeartbeat = -1
             while (true) {
+                if (cancelRequested.get()) {
+                    future.cancel(true)
+                    return DownloadResponse(130, "DOWNLOAD_CANCELLED")
+                }
                 try {
                     val response = future.get(1, TimeUnit.SECONDS)
                     val exitCode = response?.javaClass?.getDeclaredField("exitCode")?.let {
@@ -345,6 +446,10 @@ class VideoDownloader(private val context: Context) {
                     } }.getOrNull() ?: ""
                     return DownloadResponse(exitCode, out, err)
                 } catch (_: TimeoutException) {
+                    if (cancelRequested.get()) {
+                        future.cancel(true)
+                        return DownloadResponse(130, "DOWNLOAD_CANCELLED")
+                    }
                     val now = SystemClock.elapsedRealtime()
                     if (now - lastActivityAt.get() >= timeoutMs) {
                         future.cancel(true)
@@ -362,6 +467,7 @@ class VideoDownloader(private val context: Context) {
                 }
             }
         } finally {
+            activeRequestFuture.set(null)
             executor.shutdownNow()
         }
     }

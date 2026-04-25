@@ -22,6 +22,7 @@ import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -37,11 +38,25 @@ private const val YT_DLP_UPDATE_INTERVAL_MS = 12 * 60 * 60 * 1000L
 private const val YT_DLP_UPDATE_TIMEOUT_SEC = 8L
 
 data class DownloadResponse(val exitCode: Int, val out: String, val err: String = "")
+class DownloadCancelledException : IOException("Загрузка отменена")
 
 class YouTubeDownloader(private val context: Context) {
 
     private val initialized = AtomicBoolean(false)
     private val metaPrefs = context.getSharedPreferences("youoffline_meta", Context.MODE_PRIVATE)
+    private val cancelRequested = AtomicBoolean(false)
+    private val activeRequestFuture = AtomicReference<Future<*>?>(null)
+
+    fun cancelActiveDownload() {
+        cancelRequested.set(true)
+        activeRequestFuture.get()?.cancel(true)
+    }
+
+    private fun ensureNotCancelled() {
+        if (cancelRequested.get()) {
+            throw DownloadCancelledException()
+        }
+    }
 
     private fun ensureYtDlpInitialized() {
         if (initialized.get()) {
@@ -139,6 +154,8 @@ class YouTubeDownloader(private val context: Context) {
     ): DownloadedAudio {
         val totalStart = SystemClock.elapsedRealtime()
         Log.d(TAG, "====== START DOWNLOAD: $url, proxy=$useProxy ======")
+        cancelRequested.set(false)
+        ensureNotCancelled()
 
         val initStart = SystemClock.elapsedRealtime()
         ensureYtDlpInitialized()
@@ -175,6 +192,7 @@ class YouTubeDownloader(private val context: Context) {
         val saveStart = SystemClock.elapsedRealtime()
 
         while (true) {
+            ensureNotCancelled()
             val chunkRange = if (isPlaylist) {
                 val start = chunkIndex * playlistChunkSize + 1
                 "$start-${start + playlistChunkSize - 1}"
@@ -211,6 +229,7 @@ class YouTubeDownloader(private val context: Context) {
             Log.d(TAG, "First attempt (${clients[0]} client, fast format): exitCode=${lastResponse.exitCode}")
 
             for ((idx, client) in clients.drop(1).withIndex()) {
+                ensureNotCancelled()
                 if (lastResponse.exitCode == 0) {
                     Log.d(TAG, "Download succeeded on attempt ${idx}")
                     break
@@ -329,6 +348,7 @@ class YouTubeDownloader(private val context: Context) {
             if (chunkNewMediaFiles.isNotEmpty()) {
                 playlistProducedFiles = true
                 chunkNewMediaFiles.forEachIndexed { index, file ->
+                    ensureNotCancelled()
                     val totalInChunk = chunkNewMediaFiles.size
                     val chunkLabel = if (isPlaylist) " (пакет $chunkRange)" else ""
                     onProgress(1f, "Сохранение ${index + 1}/$totalInChunk$chunkLabel")
@@ -366,6 +386,10 @@ class YouTubeDownloader(private val context: Context) {
 
         }
         Log.d(TAG, "TIMING ytDlpStageTotal=${elapsedMs(ytdlpStart)}ms")
+
+        if (cancelRequested.get() || lastResponse.exitCode == 130) {
+            throw DownloadCancelledException()
+        }
 
         if (lastResponse.exitCode != 0 && saved.isEmpty()) {
             val details = lastResponse.out.ifBlank { "yt-dlp завершился с ошибкой, код=${lastResponse.exitCode}" }
@@ -643,9 +667,14 @@ class YouTubeDownloader(private val context: Context) {
                     onProgress(p, msg)
                 }
             }
+            activeRequestFuture.set(future)
 
             var lastHeartbeatSecond = -1
             while (true) {
+                if (cancelRequested.get()) {
+                    future.cancel(true)
+                    return DownloadResponse(130, "DOWNLOAD_CANCELLED")
+                }
                 try {
                     val response = future.get(1, TimeUnit.SECONDS)
                     Log.d(TAG, "executeRequest: Got response, parsing...")
@@ -664,6 +693,10 @@ class YouTubeDownloader(private val context: Context) {
                     Log.d(TAG, "Output (first 500 chars): ${out.take(500)}")
                     return DownloadResponse(exitCode, out)
                 } catch (_: TimeoutException) {
+                    if (cancelRequested.get()) {
+                        future.cancel(true)
+                        return DownloadResponse(130, "DOWNLOAD_CANCELLED")
+                    }
                     val now = SystemClock.elapsedRealtime()
                     val idleMs = now - lastActivityAt.get()
                     if (idleMs >= timeoutMs) {
@@ -694,6 +727,7 @@ class YouTubeDownloader(private val context: Context) {
             Log.e(TAG, "executeRequest: Exception occurred", e)
             return DownloadResponse(1, e.message ?: "Ошибка при выполнении запроса")
         } finally {
+            activeRequestFuture.set(null)
             executor.shutdownNow()
             Log.d(TAG, "executeRequest: Executor shutdown")
         }

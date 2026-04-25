@@ -6,12 +6,14 @@ import android.net.Uri
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.youoffline.downloader.DownloadCancelledException
 import com.example.youoffline.downloader.YouTubeDownloader
 import com.example.youoffline.model.DownloadedAudio
 import com.example.youoffline.model.DownloadQuality
 import com.example.youoffline.model.DownloadUiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -29,6 +31,7 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
     private val downloader = YouTubeDownloader(application)
     private val player = MediaPlayer()
     private var progressJob: Job? = null
+    private var downloadJob: Job? = null
 
     private val _uiState = MutableStateFlow(DownloadUiState())
     val uiState: StateFlow<DownloadUiState> = _uiState.asStateFlow()
@@ -61,14 +64,15 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun startDownload() {
         val current = _uiState.value
+        if (current.isDownloading) return
         if (current.url.isBlank()) {
             _uiState.update { it.copy(status = "Введите URL") }
             return
         }
 
-        viewModelScope.launch {
+        downloadJob = viewModelScope.launch {
             _uiState.update { it.copy(isDownloading = true, progress = 0f, status = "Подготовка скачивания") }
-            runCatching {
+            try {
                 withContext(Dispatchers.IO) {
                     var prepProgress = 0f
                     var downloadPhaseStarted = false
@@ -162,10 +166,27 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
                         }
                     )
                 }
-            }.onSuccess {
                 _uiState.update { it.copy(isDownloading = false, progress = 1f, status = "Готово", url = "") }
                 refreshDownloads()
-            }.onFailure { error ->
+            } catch (_: CancellationException) {
+                _uiState.update {
+                    it.copy(
+                        isDownloading = false,
+                        progress = 0f,
+                        status = ""
+                    )
+                }
+                refreshDownloads()
+            } catch (_: DownloadCancelledException) {
+                _uiState.update {
+                    it.copy(
+                        isDownloading = false,
+                        progress = 0f,
+                        status = ""
+                    )
+                }
+                refreshDownloads()
+            } catch (error: Exception) {
                 _uiState.update {
                     it.copy(
                         isDownloading = false,
@@ -173,8 +194,17 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
                 refreshDownloads()
+            } finally {
+                downloadJob = null
             }
         }
+    }
+
+    fun cancelDownload() {
+        if (!_uiState.value.isDownloading) return
+        _uiState.update { it.copy(isDownloading = false, progress = 0f, status = "") }
+        downloader.cancelActiveDownload()
+        downloadJob?.cancel()
     }
 
     private fun extractTitleFromDestination(raw: String): String? {
@@ -378,6 +408,7 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
     }
 
     override fun onCleared() {
+        downloadJob?.cancel()
         progressJob?.cancel()
         player.release()
         super.onCleared()

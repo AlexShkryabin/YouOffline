@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ScreenRotation
 import androidx.compose.material.icons.filled.ScreenLockRotation
 import androidx.compose.material.icons.filled.MusicNote
@@ -484,6 +485,16 @@ private fun VideoScreen(viewModel: VideoViewModel) {
                             value = state.url,
                             onValueChange = viewModel::onUrlChange,
                             label = { Text("Ссылка на страницу") },
+                            trailingIcon = {
+                                if (state.url.isNotBlank()) {
+                                    IconButton(onClick = { viewModel.onUrlChange("") }) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "Очистить ссылку"
+                                        )
+                                    }
+                                }
+                            },
                             singleLine = true
                         )
 
@@ -501,10 +512,14 @@ private fun VideoScreen(viewModel: VideoViewModel) {
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Button(
-                                onClick = viewModel::startDownload,
-                                enabled = !state.isDownloading,
+                                onClick = {
+                                    if (state.isDownloading) viewModel.cancelDownload() else viewModel.startDownload()
+                                },
+                                enabled = state.isDownloading || state.url.isNotBlank(),
                                 modifier = Modifier.weight(1.2f).height(50.dp)
-                            ) { Text("Скачать") }
+                            ) {
+                                Text(if (state.isDownloading) "Отмена" else "Скачать")
+                            }
 
                             Box(
                                 modifier = Modifier.weight(1f),
@@ -1161,6 +1176,16 @@ private fun MainScreen(
                                 value = state.url,
                                 onValueChange = viewModel::onUrlChange,
                                 label = { Text("Ссылка на страницу") },
+                                trailingIcon = {
+                                    if (state.url.isNotBlank()) {
+                                        IconButton(onClick = { viewModel.onUrlChange("") }) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Close,
+                                                contentDescription = "Очистить ссылку"
+                                            )
+                                        }
+                                    }
+                                },
                                 singleLine = true
                             )
                             val qualityShortLabel = when (state.downloadQuality) {
@@ -1174,13 +1199,15 @@ private fun MainScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Button(
-                                    onClick = viewModel::startDownload,
-                                    enabled = !state.isDownloading,
+                                    onClick = {
+                                        if (state.isDownloading) viewModel.cancelDownload() else viewModel.startDownload()
+                                    },
+                                    enabled = state.isDownloading || state.url.isNotBlank(),
                                     modifier = Modifier
                                         .weight(1.2f)
                                         .height(50.dp)
                                 ) {
-                                    Text("Скачать")
+                                    Text(if (state.isDownloading) "Отмена" else "Скачать")
                                 }
 
                                 Box(
