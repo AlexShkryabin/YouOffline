@@ -140,6 +140,8 @@ class MainActivity : ComponentActivity() {
     private val viewModel: DownloadViewModel by viewModels()
     private val videoViewModel: VideoViewModel by viewModels()
     private val urlRegex = Regex("https?://\\S+")
+    var sharedUrl: String? = null
+    var selectedTab: Int = 0  // 0 = audio, 1 = video
 
     private val mediaReadPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
@@ -189,7 +191,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             YouOfflineTheme {
-                AppRoot(audioViewModel = viewModel, videoViewModel = videoViewModel)
+                AppRoot(audioViewModel = viewModel, videoViewModel = videoViewModel, mainActivity = this)
             }
         }
     }
@@ -208,10 +210,28 @@ class MainActivity : ComponentActivity() {
         if (sharedText.isBlank()) return
 
         val url = extractFirstUrl(sharedText) ?: return
-        viewModel.onUrlChange(url)
-        viewModel.startDownload()
+        sharedUrl = url
         ShortcutManagerCompat.reportShortcutUsed(this, SHARE_SHORTCUT_ID)
     }
+
+    fun handleShareUrlSelection(format: String) {
+        val url = sharedUrl ?: return
+        
+        when (format) {
+            "audio" -> {
+                selectedTab = 0
+                viewModel.onUrlChange(url)
+                viewModel.startDownload()
+            }
+            "video" -> {
+                selectedTab = 1
+                videoViewModel.onUrlChange(url)
+                videoViewModel.startDownload()
+            }
+        }
+        sharedUrl = null
+    }
+
 
     private fun ensureMediaLibraryAccessAndRefresh() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -275,10 +295,51 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 private fun AppRoot(
     audioViewModel: DownloadViewModel,
-    videoViewModel: VideoViewModel
+    videoViewModel: VideoViewModel,
+    mainActivity: MainActivity
 ) {
-    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(mainActivity.selectedTab) }
     val videoState by videoViewModel.uiState.collectAsStateWithLifecycle()
+    var showShareDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(mainActivity.sharedUrl) {
+        showShareDialog = mainActivity.sharedUrl != null
+    }
+
+    LaunchedEffect(mainActivity.selectedTab) {
+        selectedTab = mainActivity.selectedTab
+    }
+
+    if (showShareDialog && mainActivity.sharedUrl != null) {
+        AlertDialog(
+            onDismissRequest = { 
+                showShareDialog = false
+                mainActivity.sharedUrl = null
+            },
+            title = { Text("Выберите формат") },
+            text = { Text("Скачать видео или аудио?") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        mainActivity.handleShareUrlSelection("audio")
+                        showShareDialog = false
+                    }
+                ) {
+                    Text("🎵 Аудио")
+                }
+            },
+            dismissButton = {
+                Button(
+                    onClick = {
+                        mainActivity.handleShareUrlSelection("video")
+                        showShareDialog = false
+                    }
+                ) {
+                    Text("🎬 Видео")
+                }
+            }
+        )
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(

@@ -136,14 +136,8 @@ class VideoDownloader(private val context: Context) {
         while (true) {
             ensureNotCancelled()
 
-            val chunkRange = if (isPlaylist) {
-                val trackNum = chunkIndex + 1
-                onTrackStart?.invoke(trackNum)
-                onProgress(0f, "Трек $trackNum · Подготовка...")
-                "$trackNum-$trackNum"
-            } else {
-                null
-            }
+            val trackNum = if (isPlaylist) chunkIndex + 1 else 0
+            val chunkRange = if (isPlaylist) "$trackNum-$trackNum" else null
 
             val beforeFiles = tempDir.listFiles()?.map { it.absolutePath }?.toSet() ?: emptySet()
             lastResponse = downloadSingleRequestWithFallback(
@@ -174,6 +168,11 @@ class VideoDownloader(private val context: Context) {
                     throw IOException(details)
                 }
                 break
+            }
+
+            // Track start notification comes after confirming file was downloaded
+            if (isPlaylist && trackNum > 0) {
+                onTrackStart?.invoke(trackNum)
             }
 
             val thumbExts = setOf("jpg", "jpeg", "webp")
