@@ -381,7 +381,15 @@ private fun VideoScreen(viewModel: VideoViewModel) {
     var wasDownloading by rememberSaveable { mutableStateOf(false) }
 
     DisposableEffect(interstitialAdManager) {
-        onDispose { interstitialAdManager.destroy() }
+        viewModel.setOnPlaylistComplete {
+            if (BuildConfig.ENABLE_YANDEX_ADS) {
+                interstitialAdManager.showAd(onAdDismissed = {})
+            }
+        }
+        onDispose { 
+            interstitialAdManager.destroy()
+            viewModel.setOnPlaylistComplete(null)
+        }
     }
 
     LaunchedEffect(state.downloadedFiles.firstOrNull()?.pathOrUri) {

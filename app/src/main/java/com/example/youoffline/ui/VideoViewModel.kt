@@ -21,6 +21,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     private val downloader = VideoDownloader(application)
     private var downloadJob: Job? = null
+    private var downloadedTrackCount = 0
+    private var onPlaylistComplete: (() -> Unit)? = null
 
     private val _uiState = MutableStateFlow(VideoUiState())
     val uiState: StateFlow<VideoUiState> = _uiState.asStateFlow()
@@ -41,6 +43,10 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(downloadQuality = quality) }
     }
 
+    fun setOnPlaylistComplete(callback: (() -> Unit)?) {
+        onPlaylistComplete = callback
+    }
+
     fun startDownload() {
         val current = _uiState.value
         if (current.isDownloading) return
@@ -49,6 +55,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        downloadedTrackCount = 0
         downloadJob = viewModelScope.launch {
             _uiState.update { it.copy(isDownloading = true, progress = 0f, status = "Подготовка скачивания") }
             try {
@@ -115,6 +122,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                             _uiState.update { it.copy(progress = stableProgress, status = mappedStatus) }
                         },
                         onTrackSaved = {
+                            downloadedTrackCount++
                             viewModelScope.launch {
                                 _uiState.update { state ->
                                     state.copy(
@@ -138,6 +146,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 _uiState.update { it.copy(isDownloading = false, progress = 1f, status = "Готово", url = "") }
                 refreshLibrary()
+                if (downloadedTrackCount > 2) {
+                    onPlaylistComplete?.invoke()
+                }
             } catch (_: CancellationException) {
                 _uiState.update {
                     it.copy(isDownloading = false, progress = 0f, status = "")
