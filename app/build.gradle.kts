@@ -39,10 +39,10 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.youoffline"
+        applicationId = "com.example.youoff"
         minSdk = 24
         targetSdk = 36
-        versionCode = 4
+        versionCode = 2
         versionName = "1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

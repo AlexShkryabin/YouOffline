@@ -36,6 +36,11 @@ private const val YT_DLP_UPDATE_ATTEMPT_KEY = "yt_dlp_last_update_attempt_ms"
 private const val YT_DLP_UPDATE_SUCCESS_KEY = "yt_dlp_last_update_success_ms"
 private const val YT_DLP_UPDATE_INTERVAL_MS = 12 * 60 * 60 * 1000L
 private const val YT_DLP_UPDATE_TIMEOUT_SEC = 8L
+private const val YT_ANDROID_USER_AGENT = "com.google.android.youtube/19.16.39 (Linux; U; Android 13)"
+private const val YT_REQUEST_GAP_MS = 900L
+private const val YT_RETRY_GAP_MS = 450L
+private const val YT_BOT_RETRY_LIMIT = 3
+private const val PREF_AUDIO_CLIENT = "yt_audio_preferred_client"
 
 data class DownloadResponse(val exitCode: Int, val out: String, val err: String = "")
 class DownloadCancelledException : IOException("Загрузка отменена")
@@ -172,15 +177,21 @@ class YouTubeDownloader(private val context: Context) {
         val beforeMediaFiles = listMediaFiles(tempDir).map { it.absolutePath }.toSet()
         val isPlaylist = isPlaylistUrl(url)
 
-        // For playlists prefer android first (usually less JS challenge overhead),
-        // while keeping full fallback chain for reliability.
-        val clients = if (isPlaylist) {
-            listOf<String?>("android", "mweb", "web", "web_creator", null)
+        // Avoid Android clients as the first choice because they now often require
+        // a PO token on some networks and trigger false failures on Wi-Fi.
+        val defaultClients = if (isPlaylist) {
+            listOf<String?>("mweb", "tv_embedded", "web", "android", "web_creator", null)
         } else {
-            listOf<String?>("mweb", "android", "web", "web_creator", null)
+            listOf<String?>("mweb", "ios", "tv_embedded", "web", "android", "web_creator", null)
+        }
+        val preferredClient = preferredAudioClient()
+        val clients = if (preferredClient.isNullOrBlank()) {
+            defaultClients
+        } else {
+            listOf(preferredClient) + defaultClients.filter { it != preferredClient }
         }
         val baseAttempts = clients.size
-        Log.d(TAG, "Starting client fallback chain with ${clients.size} clients")
+        Log.d(TAG, "Starting client fallback chain with ${clients.size} clients, preferred=$preferredClient")
 
         val ytdlpStart = SystemClock.elapsedRealtime()
         var lastResponse = DownloadResponse(1, "Не начато")
@@ -198,6 +209,11 @@ class YouTubeDownloader(private val context: Context) {
                 "$start-${start + playlistChunkSize - 1}"
             } else {
                 null
+            }
+
+            if (isPlaylist && chunkIndex > 0) {
+                onProgress(0f, "Пауза перед следующим треком...")
+                SystemClock.sleep(YT_REQUEST_GAP_MS)
             }
 
             if (isPlaylist) {
@@ -223,9 +239,11 @@ class YouTubeDownloader(private val context: Context) {
                     allowPlaylist = isPlaylist,
                     playlistItems = chunkRange
                 ),
-                onProgress,
-                timeoutSeconds = if (isPlaylist) 120L else 60L
+                onProgress
             )
+            if (lastResponse.exitCode == 0) {
+                rememberAudioClient(clients[0])
+            }
             Log.d(TAG, "First attempt (${clients[0]} client, fast format): exitCode=${lastResponse.exitCode}")
 
             for ((idx, client) in clients.drop(1).withIndex()) {
@@ -234,34 +252,22 @@ class YouTubeDownloader(private val context: Context) {
                     Log.d(TAG, "Download succeeded on attempt ${idx}")
                     break
                 }
-                val out = lastResponse.out
-                Log.d(TAG, "Attempt ${idx} failed. Output: ${out.take(200)}")
+                val details = fullOutput(lastResponse)
+                Log.d(TAG, "Attempt ${idx} failed. Output: ${details.take(300)}")
 
-                val isRetryable = out.contains("403", ignoreCase = true) ||
-                    out.contains("SABR", ignoreCase = true) ||
-                    out.contains("missing a url", ignoreCase = true) ||
-                    out.contains("forcing SABR streaming", ignoreCase = true) ||
-                    out.contains("PO Token", ignoreCase = true) ||
-                    out.contains("Please sign in", ignoreCase = true) ||
-                    out.contains("--cookies-from-browser", ignoreCase = true) ||
-                    out.contains("for the authentication", ignoreCase = true) ||
-                    out.contains("HTTP Error 416", ignoreCase = true) ||
-                    out.contains("Requested range not satisfiable", ignoreCase = true) ||
-                    out.contains("unsupported client", ignoreCase = true) ||
-                    out.contains("Skipping unsupported client", ignoreCase = true) ||
-                    out.contains("The page needs to be reloaded", ignoreCase = true) ||
-                    out.contains("needs to be reloaded", ignoreCase = true) ||
-                    out.contains("Only images are available", ignoreCase = true) ||
-                    out.contains("drm protected", ignoreCase = true) ||
-                    out.contains("not available", ignoreCase = true) ||
-                    out.contains("Requested format is not available", ignoreCase = true)
+                val isRetryable = isRetryableYoutubeError(details)
                 if (!isRetryable) {
                     Log.d(TAG, "Error not retryable, breaking")
+                    break
+                }
+                if (isBotChallengeError(details) && idx >= YT_BOT_RETRY_LIMIT - 1) {
+                    Log.d(TAG, "Bot challenge persists after limited retries, moving to dedicated fallback")
                     break
                 }
                 Log.d(TAG, "Retrying with client: $client")
                 val attemptNo = idx + 2 // first request is 1, retries start from 2
                 onProgress(0f, "Повторная попытка $attemptNo/$baseAttempts: режим ${client ?: "neutral"}")
+                SystemClock.sleep(YT_RETRY_GAP_MS)
                 val retryStart = SystemClock.elapsedRealtime()
                 lastResponse = executeRequest(
                     buildDownloadRequest(
@@ -275,18 +281,20 @@ class YouTubeDownloader(private val context: Context) {
                         allowPlaylist = isPlaylist,
                         playlistItems = chunkRange
                     ),
-                    onProgress,
-                    timeoutSeconds = if (isPlaylist) 120L else 60L
+                    onProgress
                 )
+                if (lastResponse.exitCode == 0) {
+                    rememberAudioClient(client)
+                }
                 Log.d(TAG, "Retry attempt ${idx} with $client: exitCode=${lastResponse.exitCode}")
                 Log.d(TAG, "TIMING retry[$client]=${elapsedMs(retryStart)}ms")
             }
 
             // Run neutral fallback only as last resort for explicit reload-required errors.
             if (lastResponse.exitCode != 0) {
-                val out = lastResponse.out
-                val needsReload = out.contains("needs to be reloaded", ignoreCase = true) ||
-                    out.contains("page needs to be reloaded", ignoreCase = true)
+                val details = fullOutput(lastResponse)
+                val needsReload = details.contains("needs to be reloaded", ignoreCase = true) ||
+                    details.contains("page needs to be reloaded", ignoreCase = true)
                 if (needsReload) {
                     Log.w(TAG, "Detected reload-required error after client chain, running short neutral retry")
                     onProgress(0f, "Доп. попытка: перезагрузка источника, нейтральный режим")
@@ -303,22 +311,25 @@ class YouTubeDownloader(private val context: Context) {
                             allowPlaylist = isPlaylist,
                             playlistItems = chunkRange
                         ),
-                        onProgress,
-                        timeoutSeconds = if (isPlaylist) 120L else 60L
+                        onProgress
                     )
+                    if (lastResponse.exitCode == 0) {
+                        rememberAudioClient(null)
+                    }
                     Log.d(TAG, "Neutral retry exitCode=${lastResponse.exitCode}")
                     Log.d(TAG, "TIMING neutralRetry=${elapsedMs(neutralStart)}ms")
                 }
             }
 
             // Dedicated fallback for HTTP 416: retry via ffmpeg downloader with seek disabled.
-            if (lastResponse.exitCode != 0) {
-                val out = lastResponse.out
-                val isHttp416 = out.contains("HTTP Error 416", ignoreCase = true) ||
-                    out.contains("Requested range not satisfiable", ignoreCase = true)
+            if (lastResponse.exitCode != 0 && !isBotChallengeError(fullOutput(lastResponse))) {
+                val details = fullOutput(lastResponse)
+                val isHttp416 = details.contains("HTTP Error 416", ignoreCase = true) ||
+                    details.contains("Requested range not satisfiable", ignoreCase = true)
                 if (isHttp416) {
                     Log.w(TAG, "Detected HTTP 416, running no-range fallback retry")
                     onProgress(0f, "Доп. попытка: ошибка 416, совместимый режим")
+                    SystemClock.sleep(YT_RETRY_GAP_MS)
                     val noRangeStart = SystemClock.elapsedRealtime()
                     lastResponse = executeRequest(
                         buildDownloadRequest(
@@ -333,11 +344,37 @@ class YouTubeDownloader(private val context: Context) {
                             allowPlaylist = isPlaylist,
                             playlistItems = chunkRange
                         ),
-                        onProgress,
-                        timeoutSeconds = if (isPlaylist) 120L else 60L
+                        onProgress
                     )
+                    if (lastResponse.exitCode == 0) {
+                        rememberAudioClient("web")
+                    }
                     Log.d(TAG, "No-range retry exitCode=${lastResponse.exitCode}")
                     Log.d(TAG, "TIMING noRangeRetry=${elapsedMs(noRangeStart)}ms")
+                }
+            }
+
+            // Dedicated anti-bot fallback: safer client mix with request gap.
+            if (lastResponse.exitCode != 0 && isBotChallengeError(fullOutput(lastResponse))) {
+                Log.w(TAG, "Detected anti-bot challenge, trying dedicated client fallback")
+                onProgress(0f, "YouTube требует проверку сети, последняя попытка...")
+                SystemClock.sleep(YT_RETRY_GAP_MS)
+                lastResponse = executeRequest(
+                    buildDownloadRequest(
+                        url = url,
+                        tempDir = tempDir,
+                        useProxy = useProxy,
+                        playerClient = "ios,tv_embedded",
+                        fastFormat = false,
+                        fastExtractorHints = false,
+                        quality = quality,
+                        allowPlaylist = isPlaylist,
+                        playlistItems = chunkRange
+                    ),
+                    onProgress
+                )
+                if (lastResponse.exitCode == 0) {
+                    rememberAudioClient("ios,tv_embedded")
                 }
             }
 
@@ -392,9 +429,15 @@ class YouTubeDownloader(private val context: Context) {
         }
 
         if (lastResponse.exitCode != 0 && saved.isEmpty()) {
-            val details = lastResponse.out.ifBlank { "yt-dlp завершился с ошибкой, код=${lastResponse.exitCode}" }
+            val details = fullOutput(lastResponse)
+                .ifBlank { "yt-dlp завершился с ошибкой, код=${lastResponse.exitCode}" }
             Log.e(TAG, "Download failed: $details")
-            throw IOException("$details (yt-dlp: $versionAfter)")
+            val userMessage = if (isBotChallengeError(details)) {
+                "YouTube отклонил запрос с этой сети. Попробуйте мобильный интернет, другой Wi-Fi или повторите позже. (yt-dlp: $versionAfter)"
+            } else {
+                "$details (yt-dlp: $versionAfter)"
+            }
+            throw IOException(userMessage)
         }
 
         if (saved.isEmpty() && !playlistProducedFiles) {
@@ -537,6 +580,9 @@ class YouTubeDownloader(private val context: Context) {
             addOption("--force-overwrites")
             addOption("--extractor-retries", "3")
             addOption("--fragment-retries", "3")
+            addOption("--sleep-requests", "1")
+            addOption("--user-agent", YT_ANDROID_USER_AGENT)
+            addOption("--add-header", "Accept-Language: en-US,en;q=0.9")
             if (forceNoRange) {
                 addOption("--downloader", "ffmpeg")
                 addOption("--downloader-args", "ffmpeg_i:-http_seekable 0")
@@ -591,13 +637,10 @@ class YouTubeDownloader(private val context: Context) {
 
     private fun executeRequest(
         request: YoutubeDLRequest,
-        onProgress: (Float, String) -> Unit,
-        timeoutSeconds: Long = 60
+        onProgress: (Float, String) -> Unit
     ): DownloadResponse {
-        Log.d(TAG, "executeRequest: Starting with inactivity timeout=${timeoutSeconds}s")
+        Log.d(TAG, "executeRequest: Starting")
         val requestStart = SystemClock.elapsedRealtime()
-        val timeoutMs = timeoutSeconds * 1000L
-        val lastActivityAt = AtomicLong(SystemClock.elapsedRealtime())
         val currentItem = AtomicReference<String>("подготовка")
         val itemNum = AtomicInteger(0)
         val pendingItemNum = AtomicInteger(0)
@@ -632,7 +675,6 @@ class YouTubeDownloader(private val context: Context) {
                 val destinationRegex = Regex("""(?i)^\[download]\s+Destination:\s+""")
                 YoutubeDL.getInstance().execute(request) { progress, etaInSeconds, line ->
                     lineCount++
-                    lastActivityAt.set(SystemClock.elapsedRealtime())
                     parseCurrentItem(line)?.let { currentItem.set(it) }
 
                     if (!line.isNullOrBlank()) {
@@ -687,28 +729,26 @@ class YouTubeDownloader(private val context: Context) {
                         it.isAccessible = true
                         it.get(response) as String
                     } ?: ""
+                    val err = runCatching {
+                        response?.javaClass?.getDeclaredField("err")?.let {
+                            it.isAccessible = true
+                            it.get(response) as? String
+                        }
+                    }.getOrNull() ?: ""
 
                     Log.d(TAG, "executeRequest: exitCode=$exitCode, output length=${out.length}")
                     Log.d(TAG, "TIMING executeRequest=${elapsedMs(requestStart)}ms")
                     Log.d(TAG, "Output (first 500 chars): ${out.take(500)}")
-                    return DownloadResponse(exitCode, out)
+                    if (err.isNotBlank()) {
+                        Log.d(TAG, "Err (first 300 chars): ${err.take(300)}")
+                    }
+                    return DownloadResponse(exitCode, out, err)
                 } catch (_: TimeoutException) {
                     if (cancelRequested.get()) {
                         future.cancel(true)
                         return DownloadResponse(130, "DOWNLOAD_CANCELLED")
                     }
                     val now = SystemClock.elapsedRealtime()
-                    val idleMs = now - lastActivityAt.get()
-                    if (idleMs >= timeoutMs) {
-                        val itemLabel = currentItem.get().ifBlank { "текущий этап" }
-                        Log.e(TAG, "INACTIVITY TIMEOUT after ${timeoutSeconds}s on $itemLabel")
-                        Log.d(TAG, "TIMING executeRequestInactivityTimeout=${elapsedMs(requestStart)}ms")
-                        future.cancel(true)
-                        val timeoutMsg = "Таймаут бездействия ${timeoutSeconds}с: $itemLabel"
-                        onProgress(0f, timeoutMsg)
-                        return DownloadResponse(124, timeoutMsg)
-                    }
-
                     val waitSec = ((now - requestStart) / 1000L).toInt()
                     if (waitSec >= 10 && waitSec % 5 == 0 && waitSec != lastHeartbeatSecond) {
                         lastHeartbeatSecond = waitSec
@@ -755,6 +795,55 @@ class YouTubeDownloader(private val context: Context) {
 
     private fun isPlaylistUrl(url: String): Boolean {
         return url.contains("list=", ignoreCase = true)
+    }
+
+    private fun preferredAudioClient(): String? {
+        return metaPrefs.getString(PREF_AUDIO_CLIENT, null)?.takeIf { it.isNotBlank() }
+    }
+
+    private fun rememberAudioClient(client: String?) {
+        if (client.isNullOrBlank()) return
+        if (metaPrefs.getString(PREF_AUDIO_CLIENT, null) == client) return
+        metaPrefs.edit().putString(PREF_AUDIO_CLIENT, client).apply()
+        Log.d(TAG, "Remembered preferred audio client: $client")
+    }
+
+    private fun fullOutput(response: DownloadResponse): String {
+        return listOf(response.out, response.err)
+            .filter { it.isNotBlank() }
+            .joinToString("\n")
+    }
+
+    private fun isBotChallengeError(message: String): Boolean {
+        if (message.isBlank()) return false
+        val text = message.lowercase(Locale.US)
+        return text.contains("sign in to confirm you're not a bot") ||
+            text.contains("please sign in") ||
+            text.contains("use --cookies-from-browser") ||
+            text.contains("use --cookies") ||
+            text.contains("for the authentication") ||
+            text.contains("no title found in player responses")
+    }
+
+    private fun isRetryableYoutubeError(message: String): Boolean {
+        if (message.isBlank()) return false
+        val text = message.lowercase(Locale.US)
+        return text.contains("403") ||
+            text.contains("sabr") ||
+            text.contains("missing a url") ||
+            text.contains("forcing sabr streaming") ||
+            text.contains("po token") ||
+            text.contains("gvs po token") ||
+            text.contains("http error 416") ||
+            text.contains("requested range not satisfiable") ||
+            text.contains("unsupported client") ||
+            text.contains("skipping unsupported client") ||
+            text.contains("needs to be reloaded") ||
+            text.contains("only images are available") ||
+            text.contains("drm protected") ||
+            text.contains("not available") ||
+            text.contains("requested format is not available") ||
+            isBotChallengeError(text)
     }
 
     private fun saveToMusic(source: File, channelName: String): DownloadedAudio {

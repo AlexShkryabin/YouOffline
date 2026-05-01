@@ -149,12 +149,17 @@ class MainActivity : ComponentActivity() {
 
     private val mediaReadPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            val legacyReadGranted = grants[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+            val legacyWriteGranted =
+                Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
+                    grants[Manifest.permission.WRITE_EXTERNAL_STORAGE] == true
+
             val audioGranted =
                 grants[Manifest.permission.READ_MEDIA_AUDIO] == true ||
-                    grants[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+                    (legacyReadGranted && legacyWriteGranted)
             val videoGranted =
                 grants[Manifest.permission.READ_MEDIA_VIDEO] == true ||
-                    grants[Manifest.permission.READ_EXTERNAL_STORAGE] == true
+                    (legacyReadGranted && legacyWriteGranted)
 
             if (audioGranted) {
                 viewModel.refreshDownloads()
@@ -166,7 +171,9 @@ class MainActivity : ComponentActivity() {
 
     private val deleteMediaLauncher =
         registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
-            viewModel.confirmDelete(result.resultCode == RESULT_OK)
+            val granted = result.resultCode == RESULT_OK
+            viewModel.confirmDelete(granted)
+            videoViewModel.confirmDelete(granted)
         }
 
     companion object {
@@ -183,6 +190,12 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             lifecycleScope.launch {
                 viewModel.deleteRequestUri.collect { uri ->
+                    val pi = MediaStore.createDeleteRequest(contentResolver, listOf(uri))
+                    deleteMediaLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
+                }
+            }
+            lifecycleScope.launch {
+                videoViewModel.deleteRequestUri.collect { uri ->
                     val pi = MediaStore.createDeleteRequest(contentResolver, listOf(uri))
                     deleteMediaLauncher.launch(IntentSenderRequest.Builder(pi.intentSender).build())
                 }
@@ -262,17 +275,28 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val legacyGranted =
+        val legacyReadGranted =
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) ==
                 PackageManager.PERMISSION_GRANTED
+        val legacyWriteGranted =
+            Build.VERSION.SDK_INT > Build.VERSION_CODES.P ||
+                ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+                    PackageManager.PERMISSION_GRANTED
 
-        if (legacyGranted) {
+        if (legacyReadGranted && legacyWriteGranted) {
             viewModel.refreshDownloads()
             videoViewModel.refreshLibrary()
             return
         }
 
-        mediaReadPermissionLauncher.launch(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE))
+        val legacyPermissions = buildList {
+            add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        }.toTypedArray()
+
+        mediaReadPermissionLauncher.launch(legacyPermissions)
     }
 
     private fun publishShareShortcut() {
@@ -584,6 +608,9 @@ private fun VideoScreen(viewModel: VideoViewModel) {
                             VideoQuality.Q1080P -> "1080p"
                             VideoQuality.Q720P  -> "720p"
                             VideoQuality.Q480P  -> "480p"
+                            VideoQuality.Q360P  -> "360p"
+                            VideoQuality.Q240P  -> "240p"
+                            VideoQuality.Q144P  -> "144p"
                         }
 
                         Row(
@@ -640,6 +667,18 @@ private fun VideoScreen(viewModel: VideoViewModel) {
                                         text = { Text("480p") },
                                         onClick = { viewModel.onQualitySelected(VideoQuality.Q480P); qualityExpanded = false }
                                     )
+                                    DropdownMenuItem(
+                                        text = { Text("360p") },
+                                        onClick = { viewModel.onQualitySelected(VideoQuality.Q360P); qualityExpanded = false }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("240p") },
+                                        onClick = { viewModel.onQualitySelected(VideoQuality.Q240P); qualityExpanded = false }
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("144p") },
+                                        onClick = { viewModel.onQualitySelected(VideoQuality.Q144P); qualityExpanded = false }
+                                    )
                                 }
                             }
                         }
@@ -678,7 +717,8 @@ private fun VideoScreen(viewModel: VideoViewModel) {
                         title = video.title,
                         durationMs = video.durationMs,
                         thumbnailPath = video.thumbnailPath,
-                        onClick = { viewModel.playVideo(video.pathOrUri) }
+                        onClick = { viewModel.playVideo(video.pathOrUri) },
+                        onDelete = { viewModel.deleteVideo(video.pathOrUri) }
                     )
                 }
             }
@@ -725,8 +765,10 @@ private fun VideoRow(
     title: String,
     durationMs: Long,
     thumbnailPath: String?,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onDelete: () -> Unit
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
     val thumbnail = remember(thumbnailPath) {
         thumbnailPath?.let { runCatching { BitmapFactory.decodeFile(it) }.getOrNull() }
     }
@@ -782,12 +824,34 @@ private fun VideoRow(
                     )
                 }
             }
-            Icon(
-                imageVector = Icons.Filled.PlayArrow,
-                contentDescription = "Воспроизвести",
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(28.dp)
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.PlayArrow,
+                    contentDescription = "Воспроизвести",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(28.dp)
+                )
+                Box {
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Text("⋮")
+                    }
+                    DropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Удалить") },
+                            onClick = {
+                                menuExpanded = false
+                                onDelete()
+                            }
+                        )
+                    }
+                }
+            }
         }
     }
 }

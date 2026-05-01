@@ -219,14 +219,21 @@ class DownloadViewModel(application: Application) : AndroidViewModel(application
 
     fun refreshDownloads() {
         viewModelScope.launch {
-            val files = withContext(Dispatchers.IO) { downloader.listDownloadedFiles() }
-            _uiState.update { state ->
-                val currentPath = state.nowPlaying
-                val idx = files.indexOfFirst { it.pathOrUri == currentPath }
-                state.copy(
-                    downloadedFiles = files,
-                    currentTrackIndex = if (idx >= 0) idx else state.currentTrackIndex
-                )
+            runCatching {
+                withContext(Dispatchers.IO) { downloader.listDownloadedFiles() }
+            }.onSuccess { files ->
+                _uiState.update { state ->
+                    val currentPath = state.nowPlaying
+                    val idx = files.indexOfFirst { it.pathOrUri == currentPath }
+                    state.copy(
+                        downloadedFiles = files,
+                        currentTrackIndex = if (idx >= 0) idx else state.currentTrackIndex
+                    )
+                }
+            }.onFailure { error ->
+                if (error is SecurityException) {
+                    _uiState.update { it.copy(status = "Нет доступа к медиатеке") }
+                }
             }
         }
     }

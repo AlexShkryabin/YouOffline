@@ -49,7 +49,10 @@ enum class VideoQuality {
     Q1440P,
     Q1080P,
     Q720P,
-    Q480P
+    Q480P,
+    Q360P,
+    Q240P,
+    Q144P
 }
 
 data class VideoUiState(

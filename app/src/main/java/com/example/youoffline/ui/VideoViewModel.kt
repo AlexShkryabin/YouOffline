@@ -1,6 +1,8 @@
 package com.example.youoffline.ui
 
 import android.app.Application
+import android.net.Uri
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.youoffline.downloader.DownloadCancelledException
@@ -10,8 +12,11 @@ import com.example.youoffline.model.VideoUiState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -26,6 +31,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(VideoUiState())
     val uiState: StateFlow<VideoUiState> = _uiState.asStateFlow()
+    private val _deleteRequestUri = MutableSharedFlow<Uri>(extraBufferCapacity = 1)
+    val deleteRequestUri: SharedFlow<Uri> = _deleteRequestUri.asSharedFlow()
+    private var pendingDeletePath: String? = null
 
     init {
         refreshLibrary()
@@ -185,8 +193,59 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshLibrary() {
         viewModelScope.launch {
-            val files = withContext(Dispatchers.IO) { downloader.listDownloadedVideos() }
-            _uiState.update { it.copy(downloadedFiles = files) }
+            runCatching {
+                withContext(Dispatchers.IO) { downloader.listDownloadedVideos() }
+            }.onSuccess { files ->
+                _uiState.update { it.copy(downloadedFiles = files) }
+            }.onFailure { error ->
+                if (error is SecurityException) {
+                    _uiState.update { it.copy(status = "Нет доступа к медиатеке") }
+                }
+            }
+        }
+    }
+
+    fun deleteVideo(pathOrUri: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val deletingCurrent = _uiState.value.playingUri == pathOrUri
+            if (deletingCurrent) {
+                _uiState.update {
+                    it.copy(
+                        playingUri = null,
+                        isPlayerMinimized = false,
+                        videoPlaybackPositionMs = 0L
+                    )
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && pathOrUri.startsWith("content://")) {
+                pendingDeletePath = pathOrUri
+                _deleteRequestUri.emit(Uri.parse(pathOrUri))
+                return@launch
+            }
+
+            runCatching {
+                downloader.deleteDownloadedVideo(pathOrUri)
+            }.onSuccess {
+                _uiState.update { it.copy(status = "Видео удалено") }
+                refreshLibrary()
+            }.onFailure { error ->
+                _uiState.update { it.copy(status = error.message ?: "Не удалось удалить видео") }
+            }
+        }
+    }
+
+    fun confirmDelete(granted: Boolean) {
+        val path = pendingDeletePath ?: return
+        pendingDeletePath = null
+        if (!granted) {
+            _uiState.update { it.copy(status = "Удаление отменено") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            downloader.cleanVideoMeta(path)
+            refreshLibrary()
+            _uiState.update { it.copy(status = "Видео удалено") }
         }
     }
 

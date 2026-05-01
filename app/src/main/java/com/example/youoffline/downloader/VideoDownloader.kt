@@ -2,6 +2,7 @@ package com.example.youoffline.downloader
 
 import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
@@ -32,6 +33,11 @@ private const val YT_DLP_UPDATE_ATTEMPT_KEY = "yt_dlp_last_update_attempt_ms"
 private const val YT_DLP_UPDATE_SUCCESS_KEY = "yt_dlp_last_update_success_ms"
 private const val YT_DLP_UPDATE_INTERVAL_MS = 12 * 60 * 60 * 1000L
 private const val YT_DLP_UPDATE_TIMEOUT_SEC = 8L
+private const val YT_ANDROID_USER_AGENT = "com.google.android.youtube/19.16.39 (Linux; U; Android 13)"
+private const val YT_REQUEST_GAP_MS = 900L
+private const val YT_RETRY_GAP_MS = 450L
+private const val YT_BOT_RETRY_LIMIT = 2
+private const val PREF_VIDEO_EXTRACTOR_ARGS = "yt_video_preferred_extractor_args"
 
 class VideoDownloader(private val context: Context) {
 
@@ -116,8 +122,11 @@ class VideoDownloader(private val context: Context) {
             VideoQuality.BEST   -> "bestvideo+bestaudio/bestvideo[height<=1080]+bestaudio/bestvideo[height<=720]+bestaudio/best"
             VideoQuality.Q1440P -> "bestvideo[height<=1440]+bestaudio/bestvideo[height<=1080]+bestaudio/bestvideo[height<=720]+bestaudio/best"
             VideoQuality.Q1080P -> "bestvideo[height<=1080]+bestaudio/bestvideo[height<=720]+bestaudio/bestvideo[height<=480]+bestaudio/best"
-            VideoQuality.Q720P  -> "bestvideo[height<=720]+bestaudio/bestvideo[height<=480]+bestaudio/best"
-            VideoQuality.Q480P  -> "bestvideo[height<=480]+bestaudio/best"
+            VideoQuality.Q720P  -> "bestvideo[height<=720]+bestaudio/bestvideo[height<=480]+bestaudio/bestvideo[height<=360]+bestaudio/best"
+            VideoQuality.Q480P  -> "bestvideo[height<=480]+bestaudio/bestvideo[height<=360]+bestaudio/bestvideo[height<=240]+bestaudio/best"
+            VideoQuality.Q360P  -> "bestvideo[height<=360]+bestaudio/bestvideo[height<=240]+bestaudio/best"
+            VideoQuality.Q240P  -> "bestvideo[height<=240]+bestaudio/bestvideo[height<=144]+bestaudio/best"
+            VideoQuality.Q144P  -> "bestvideo[height<=144]+bestaudio/bestvideo[height<=240]+bestaudio/best"
         }
         // Last-resort progressive: YouTube only has combined streams at 360p max.
         val progressiveFormat = when (quality) {
@@ -126,6 +135,9 @@ class VideoDownloader(private val context: Context) {
             VideoQuality.Q1080P -> "best[ext=mp4]/best"
             VideoQuality.Q720P  -> "best[ext=mp4]/best"
             VideoQuality.Q480P  -> "best[height<=480][ext=mp4]/best[height<=480]/best"
+            VideoQuality.Q360P  -> "best[height<=360][ext=mp4]/best[height<=360]/best"
+            VideoQuality.Q240P  -> "best[height<=240][ext=mp4]/best[height<=240]/best"
+            VideoQuality.Q144P  -> "best[height<=144][ext=mp4]/best[height<=144]/best[height<=240]/best"
         }
         Log.d(TAG, "DOWNLOAD_FORMAT: quality=$quality format=$format")
 
@@ -135,6 +147,11 @@ class VideoDownloader(private val context: Context) {
 
         while (true) {
             ensureNotCancelled()
+
+            if (isPlaylist && chunkIndex > 0) {
+                onProgress(0f, "Пауза перед следующим треком...")
+                SystemClock.sleep(YT_REQUEST_GAP_MS)
+            }
 
             val trackNum = if (isPlaylist) chunkIndex + 1 else 0
             val chunkRange = if (isPlaylist) "$trackNum-$trackNum" else null
@@ -204,7 +221,12 @@ class VideoDownloader(private val context: Context) {
                 .trim()
                 .ifBlank { "yt-dlp завершился с ошибкой, код=${lastResponse.exitCode}" }
             Log.e(TAG, "Final video download failure, exitCode=${lastResponse.exitCode}, details=$details")
-            throw IOException(details)
+            val userMessage = if (isBotChallengeError(details)) {
+                "YouTube отклонил запрос с этой сети. Попробуйте мобильный интернет, другой Wi-Fi или повторите позже."
+            } else {
+                details
+            }
+            throw IOException(userMessage)
         }
 
         if (savedCount == 0) {
@@ -220,32 +242,51 @@ class VideoDownloader(private val context: Context) {
         onProgress: (Float, String) -> Unit,
         playlistItems: String?
     ): DownloadResponse {
+        val initialExtractorArgs = preferredVideoExtractorArgs() ?: "youtube:player_client=mweb"
         var response = executeRequest(
             buildDownloadRequest(
                 url = url,
                 format = format,
                 tempDir = tempDir,
-                extractorArgs = "youtube:player_client=android_vr",
+                extractorArgs = initialExtractorArgs,
                 allowPlaylist = !playlistItems.isNullOrBlank(),
                 playlistItems = playlistItems
             ),
-            onProgress,
-            timeoutSeconds = 120L
+                    onProgress
         )
+        if (response.exitCode == 0) {
+            rememberVideoExtractorArgs(initialExtractorArgs)
+        }
 
         if (response.exitCode != 0) {
-            val retryPlans = listOf(
-                Triple("youtube:player_client=tv_embedded", format, "Повтор 1/4: tv_embedded клиент..."),
-                Triple("youtube:player_client=android_vr,tv_embedded", format, "Повтор 2/4: android_vr+tv_embedded..."),
-                Triple(null, format, "Повтор 3/4: клиент по умолчанию..."),
-                Triple(null, progressiveFormat, "Повтор 4/4: совместимый поток (низкое качество)...")
+            val baseRetryPlans = listOf(
+                Triple("youtube:player_client=tv_embedded", format, "Повтор 1/5: tv_embedded клиент..."),
+                Triple("youtube:player_client=web", format, "Повтор 2/5: web клиент..."),
+                Triple("youtube:player_client=android_vr,tv_embedded", format, "Повтор 3/5: android_vr+tv_embedded..."),
+                Triple(null, format, "Повтор 4/5: клиент по умолчанию..."),
+                Triple(null, progressiveFormat, "Повтор 5/5: совместимый поток (низкое качество)...")
             )
+            val preferred = preferredVideoExtractorArgs()
+            val retryPlans = if (!preferred.isNullOrBlank() && preferred != initialExtractorArgs &&
+                baseRetryPlans.none { it.first == preferred }) {
+                listOf(Triple(preferred, format, "Повтор 0/5: сохраненный режим сети...")) + baseRetryPlans
+            } else {
+                baseRetryPlans
+            }
 
-            for ((extractorArgs, retryFormat, statusText) in retryPlans) {
+            for ((retryIndex, plan) in retryPlans.withIndex()) {
+                val (extractorArgs, retryFormat, statusText) = plan
                 ensureNotCancelled()
                 if (response.exitCode == 0) break
 
+                val details = (response.out + "\n" + response.err).trim()
+                if (isBotChallengeError(details) && retryIndex >= YT_BOT_RETRY_LIMIT) {
+                    Log.w(TAG, "Bot challenge persists, skipping remaining generic retries")
+                    break
+                }
+
                 onProgress(0f, statusText)
+                SystemClock.sleep(YT_RETRY_GAP_MS)
                 Log.w(
                     TAG,
                     "Retry after failure: extractorArgs=${extractorArgs ?: "default"}, format=$retryFormat"
@@ -260,13 +301,35 @@ class VideoDownloader(private val context: Context) {
                         allowPlaylist = !playlistItems.isNullOrBlank(),
                         playlistItems = playlistItems
                     ),
-                    onProgress,
-                    timeoutSeconds = 120L
+                    onProgress
                 )
+                if (response.exitCode == 0) {
+                    rememberVideoExtractorArgs(extractorArgs)
+                }
             }
         }
 
-        if (response.exitCode != 0) {
+        if (response.exitCode != 0 && isBotChallengeError(response.out + "\n" + response.err)) {
+            ensureNotCancelled()
+            onProgress(0f, "YouTube требует проверку сети, последняя попытка...")
+            SystemClock.sleep(YT_RETRY_GAP_MS)
+            response = executeRequest(
+                buildDownloadRequest(
+                    url = url,
+                    format = format,
+                    tempDir = tempDir,
+                    extractorArgs = "youtube:player_client=ios,tv_embedded",
+                    allowPlaylist = !playlistItems.isNullOrBlank(),
+                    playlistItems = playlistItems
+                ),
+                onProgress
+            )
+            if (response.exitCode == 0) {
+                rememberVideoExtractorArgs("youtube:player_client=ios,tv_embedded")
+            }
+        }
+
+        if (response.exitCode != 0 && !isBotChallengeError(response.out + "\n" + response.err)) {
             ensureNotCancelled()
             val details = (response.out + "\n" + response.err).trim()
             if (isSabrOrForbidden(details)) {
@@ -281,8 +344,7 @@ class VideoDownloader(private val context: Context) {
                         allowPlaylist = !playlistItems.isNullOrBlank(),
                         playlistItems = playlistItems
                     ),
-                    onProgress,
-                    timeoutSeconds = 120L
+                    onProgress
                 )
             }
         }
@@ -322,6 +384,11 @@ class VideoDownloader(private val context: Context) {
             addOption("--no-part")
             addOption("--no-continue")
             addOption("--force-overwrites")
+            addOption("--extractor-retries", "3")
+            addOption("--fragment-retries", "3")
+            addOption("--sleep-requests", "1")
+            addOption("--user-agent", YT_ANDROID_USER_AGENT)
+            addOption("--add-header", "Accept-Language: en-US,en;q=0.9")
             addOption("--write-thumbnail")
             addOption("--convert-thumbnails", "jpg")
             if (!extractorArgs.isNullOrBlank()) {
@@ -355,6 +422,9 @@ class VideoDownloader(private val context: Context) {
             addOption("--no-part")
             addOption("--no-continue")
             addOption("--force-overwrites")
+            addOption("--sleep-requests", "1")
+            addOption("--user-agent", YT_ANDROID_USER_AGENT)
+            addOption("--add-header", "Accept-Language: en-US,en;q=0.9")
             addOption("-f", format)
             addOption("-o", "${tempDir.absolutePath}/${uniquePrefix}_%(title)s.%(ext)s")
         }
@@ -364,22 +434,44 @@ class VideoDownloader(private val context: Context) {
         return url.contains("list=", ignoreCase = true)
     }
 
+    private fun preferredVideoExtractorArgs(): String? {
+        return metaPrefs.getString(PREF_VIDEO_EXTRACTOR_ARGS, null)?.takeIf { it.isNotBlank() }
+    }
+
+    private fun rememberVideoExtractorArgs(extractorArgs: String?) {
+        if (extractorArgs.isNullOrBlank()) return
+        if (metaPrefs.getString(PREF_VIDEO_EXTRACTOR_ARGS, null) == extractorArgs) return
+        metaPrefs.edit().putString(PREF_VIDEO_EXTRACTOR_ARGS, extractorArgs).apply()
+        Log.d(TAG, "Remembered preferred video extractor args: $extractorArgs")
+    }
+
     private fun isSabrOrForbidden(message: String): Boolean {
         if (message.isBlank()) return false
         val text = message.lowercase(Locale.US)
         return text.contains("sabr") ||
             text.contains("http error 403") ||
             text.contains("forbidden") ||
-            text.contains("missing a url")
+            text.contains("missing a url") ||
+            text.contains("po token") ||
+            text.contains("gvs po token") ||
+            isBotChallengeError(text)
+    }
+
+    private fun isBotChallengeError(message: String): Boolean {
+        if (message.isBlank()) return false
+        val text = message.lowercase(Locale.US)
+        return text.contains("sign in to confirm you're not a bot") ||
+            text.contains("please sign in") ||
+            text.contains("use --cookies-from-browser") ||
+            text.contains("use --cookies") ||
+            text.contains("for the authentication") ||
+            text.contains("no title found in player responses")
     }
 
     private fun executeRequest(
         request: YoutubeDLRequest,
-        onProgress: (Float, String) -> Unit,
-        timeoutSeconds: Long
+        onProgress: (Float, String) -> Unit
     ): DownloadResponse {
-        val timeoutMs = timeoutSeconds * 1000L
-        val lastActivityAt = AtomicLong(SystemClock.elapsedRealtime())
         val requestStart = SystemClock.elapsedRealtime()
         val executor = Executors.newSingleThreadExecutor()
         var prepProgress = 0f
@@ -389,7 +481,6 @@ class VideoDownloader(private val context: Context) {
         try {
             val future = executor.submit {
                 YoutubeDL.getInstance().execute(request) { progress, etaInSeconds, line ->
-                    lastActivityAt.set(SystemClock.elapsedRealtime())
                     val lineText = line?.trim() ?: ""
                     val p = (progress.coerceIn(0f, 100f)) / 100f
                     val isDownload = lineText.contains("[download]", ignoreCase = true) || p > 0f
@@ -450,10 +541,6 @@ class VideoDownloader(private val context: Context) {
                         return DownloadResponse(130, "DOWNLOAD_CANCELLED")
                     }
                     val now = SystemClock.elapsedRealtime()
-                    if (now - lastActivityAt.get() >= timeoutMs) {
-                        future.cancel(true)
-                        return DownloadResponse(124, "Таймаут скачивания ${timeoutSeconds}с")
-                    }
                     val sec = ((now - requestStart) / 1000L).toInt()
                     if (sec >= 10 && sec % 5 == 0 && sec != lastHeartbeat) {
                         lastHeartbeat = sec
@@ -604,6 +691,25 @@ class VideoDownloader(private val context: Context) {
             }
         }
         return result
+    }
+
+    fun deleteDownloadedVideo(pathOrUri: String) {
+        val deleted = if (pathOrUri.startsWith("content://")) {
+            context.contentResolver.delete(Uri.parse(pathOrUri), null, null) > 0
+        } else {
+            File(pathOrUri).takeIf { it.exists() }?.delete() == true
+        }
+        cleanVideoMeta(pathOrUri)
+        if (!deleted) {
+            throw IOException("Не удалось удалить видео")
+        }
+    }
+
+    fun cleanVideoMeta(pathOrUri: String) {
+        val mediaId = Uri.parse(pathOrUri).lastPathSegment
+        if (!mediaId.isNullOrBlank()) {
+            File(thumbDir, "$mediaId.jpg").takeIf { it.exists() }?.delete()
+        }
     }
 
     private fun cleanDir(dir: File) {
